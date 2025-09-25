@@ -109,13 +109,14 @@
 
 ## 배포 상태
 
-- **플랫폼**: Cloudflare Workers/Pages 기반
-- **상태**: ✅ 개발 환경 활성 (로컬)
+- **플랫폼**: Railway (Node.js 환경) + Cloudflare Pages 지원
+- **상태**: ✅ Railway 배포 준비 완료
 - **기술 스택**: 
-  - **Backend**: Hono Framework + TypeScript
+  - **Backend**: Hono Framework + TypeScript + @hono/node-server
   - **Frontend**: Vanilla JavaScript + TailwindCSS
-  - **Database**: Cloudflare D1 (SQLite)
-  - **AI**: Cloudflare AI (프로덕션) + 로컬 룰 기반 분석기 (개발)
+  - **Database**: SQLite3 (Railway) + Cloudflare D1 (Pages)
+  - **AI**: 로컬 룰 기반 감정 분석기 (한국어/영어 지원)
+- **Railway 배포**: GitHub 연동으로 자동 배포 가능
 - **마지막 업데이트**: 2025-09-25
 
 ## 권장 다음 단계
