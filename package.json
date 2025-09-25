@@ -7,11 +7,12 @@
     "dev": "tsc && node dist/server.js",
     "build": "tsc",
     "start": "node dist/server.js",
-    "railway:build": "npm run build",
+    "railway:build": "rm -rf dist && npm run build",
     "railway:start": "npm run start",
     "preview": "npm run build && npm run start",
     "clean-port": "fuser -k 3000/tcp 2>/dev/null || true",
-    "test": "curl http://localhost:3000"
+    "test": "curl http://localhost:3000",
+    "postinstall": "tsc"
   },
   "dependencies": {
     "@hono/node-server": "^1.12.0",

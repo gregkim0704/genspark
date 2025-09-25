@@ -13,13 +13,18 @@
     "outDir": "dist",
     "rootDir": "src",
     "resolveJsonModule": true,
-    "noImplicitAny": false
+    "noImplicitAny": false,
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": true
   },
   "include": [
     "src/**/*"
   ],
   "exclude": [
     "node_modules",
-    "dist"
+    "dist",
+    "**/*.spec.ts",
+    "**/*.test.ts"
   ]
 }
