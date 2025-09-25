@@ -1,92 +1,102 @@
 import { Hono } from 'hono'
+import { serve } from '@hono/node-server'
+import { serveStatic } from '@hono/node-server/serve-static'
 import { cors } from 'hono/cors'
-import { serveStatic } from 'hono/cloudflare-workers'
-import { analyzeSentiment } from './sentiment-analyzer'
+import Database from 'sqlite3'
+import { analyzeSentiment } from './sentiment-analyzer.js'
+import { readFileSync } from 'fs'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 
-type Bindings = {
-  DB: D1Database;
-  AI: Ai;
-}
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
 
-const app = new Hono<{ Bindings: Bindings }>()
+// Initialize SQLite database
+const db = new Database.Database(':memory:')
 
-// Enable CORS for API routes
-app.use('/api/*', cors())
+// Initialize database schema
+const schemaSQL = readFileSync(join(__dirname, '../migrations/0001_initial_schema.sql'), 'utf-8')
+db.exec(schemaSQL)
+
+// Seed data
+const seedSQL = readFileSync(join(__dirname, '../seed.sql'), 'utf-8')
+db.exec(seedSQL)
+
+const app = new Hono()
+
+// Enable CORS
+app.use('*', cors())
 
 // Serve static files
 app.use('/static/*', serveStatic({ root: './public' }))
 
+// Helper function to run database queries
+function runQuery(query: string, params: any[] = []): Promise<any> {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve(rows)
+      }
+    })
+  })
+}
+
+function runInsert(query: string, params: any[] = []): Promise<any> {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function(err) {
+      if (err) {
+        reject(err)
+      } else {
+        resolve({ lastID: this.lastID, changes: this.changes })
+      }
+    })
+  })
+}
+
 // Sentiment Analysis API Routes
 app.post('/api/analyze', async (c) => {
-  const { env } = c;
-  
   try {
-    const { text, language = 'ko', user_id } = await c.req.json();
+    const { text, language = 'ko', user_id } = await c.req.json()
     
     if (!text || text.trim().length === 0) {
-      return c.json({ error: '분석할 텍스트를 입력해주세요.' }, 400);
+      return c.json({ error: '분석할 텍스트를 입력해주세요.' }, 400)
     }
 
-    // Use local sentiment analysis (fallback for development)
-    let aiResponse;
-    let sentiment_score = 0;
-    let sentiment_label = 'neutral';
-    let confidence = 0;
+    // Use local sentiment analyzer
+    const localResult = analyzeSentiment(text, language)
+    let sentiment_score = 0
+    let sentiment_label = 'neutral'
+    let confidence = localResult.score
 
-    try {
-      // Try Cloudflare AI first if available
-      if (env.AI) {
-        aiResponse = await env.AI.run('@cf/huggingface/distilbert-sst-2-int8', {
-          text: text
-        });
-      }
-    } catch (error) {
-      console.log('Cloudflare AI not available, using local analyzer');
-    }
-
-    if (aiResponse && Array.isArray(aiResponse) && aiResponse.length > 0) {
-      // Use Cloudflare AI result
-      const result = aiResponse[0];
-      if (result.label === 'POSITIVE') {
-        sentiment_score = result.score;
-        sentiment_label = 'positive';
-      } else if (result.label === 'NEGATIVE') {
-        sentiment_score = -result.score;
-        sentiment_label = 'negative';
-      }
-      confidence = result.score;
+    if (localResult.label === 'POSITIVE') {
+      sentiment_score = localResult.score
+      sentiment_label = 'positive'
+    } else if (localResult.label === 'NEGATIVE') {
+      sentiment_score = -localResult.score
+      sentiment_label = 'negative'
     } else {
-      // Use local sentiment analyzer as fallback
-      const localResult = analyzeSentiment(text, language);
-      if (localResult.label === 'POSITIVE') {
-        sentiment_score = localResult.score;
-        sentiment_label = 'positive';
-      } else if (localResult.label === 'NEGATIVE') {
-        sentiment_score = -localResult.score;
-        sentiment_label = 'negative';
-      } else {
-        sentiment_score = 0;
-        sentiment_label = 'neutral';
-      }
-      confidence = localResult.score;
+      sentiment_score = 0
+      sentiment_label = 'neutral'
     }
 
     // Save to database
-    const insertResult = await env.DB.prepare(`
+    const insertResult = await runInsert(`
       INSERT INTO sentiment_analyses (user_id, input_text, sentiment_score, sentiment_label, confidence, language)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(user_id || null, text, sentiment_score, sentiment_label, confidence, language).run();
+    `, [user_id || null, text, sentiment_score, sentiment_label, confidence, language])
 
     // Update API usage
     if (user_id) {
-      await env.DB.prepare(`
+      await runInsert(`
         INSERT OR REPLACE INTO api_usage (user_id, endpoint, request_count, date)
         VALUES (?, '/api/analyze', COALESCE((SELECT request_count FROM api_usage WHERE user_id = ? AND endpoint = '/api/analyze' AND date = date('now')), 0) + 1, date('now'))
-      `).bind(user_id, user_id).run();
+      `, [user_id, user_id])
     }
 
     return c.json({
-      id: insertResult.meta.last_row_id,
+      id: insertResult.lastID,
       text,
       sentiment: {
         score: sentiment_score,
@@ -95,37 +105,36 @@ app.post('/api/analyze', async (c) => {
       },
       language,
       timestamp: new Date().toISOString()
-    });
+    })
 
   } catch (error) {
-    console.error('Sentiment analysis error:', error);
-    return c.json({ error: '감정 분석 중 오류가 발생했습니다.' }, 500);
+    console.error('Sentiment analysis error:', error)
+    return c.json({ error: '감정 분석 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // Get analysis history
 app.get('/api/history', async (c) => {
-  const { env } = c;
-  const user_id = c.req.query('user_id');
-  const limit = parseInt(c.req.query('limit') || '50');
-  const offset = parseInt(c.req.query('offset') || '0');
+  const user_id = c.req.query('user_id')
+  const limit = parseInt(c.req.query('limit') || '50')
+  const offset = parseInt(c.req.query('offset') || '0')
 
   try {
     let query = `
       SELECT id, input_text, sentiment_score, sentiment_label, confidence, language, created_at
       FROM sentiment_analyses
-    `;
-    let params: any[] = [];
+    `
+    let params: any[] = []
 
     if (user_id) {
-      query += ` WHERE user_id = ?`;
-      params.push(user_id);
+      query += ` WHERE user_id = ?`
+      params.push(user_id)
     }
 
-    query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
+    query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    params.push(limit, offset)
 
-    const { results } = await env.DB.prepare(query).bind(...params).all();
+    const results = await runQuery(query, params)
 
     return c.json({
       analyses: results,
@@ -134,96 +143,67 @@ app.get('/api/history', async (c) => {
         offset,
         has_more: results.length === limit
       }
-    });
+    })
 
   } catch (error) {
-    console.error('History fetch error:', error);
-    return c.json({ error: '히스토리 조회 중 오류가 발생했습니다.' }, 500);
+    console.error('History fetch error:', error)
+    return c.json({ error: '히스토리 조회 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // Batch analysis endpoint
 app.post('/api/batch', async (c) => {
-  const { env } = c;
-  
   try {
-    const { texts, job_name, user_id } = await c.req.json();
+    const { texts, job_name, user_id } = await c.req.json()
 
     if (!Array.isArray(texts) || texts.length === 0) {
-      return c.json({ error: '분석할 텍스트 배열을 제공해주세요.' }, 400);
+      return c.json({ error: '분석할 텍스트 배열을 제공해주세요.' }, 400)
     }
 
     // Create batch job
-    const jobResult = await env.DB.prepare(`
+    const jobResult = await runInsert(`
       INSERT INTO batch_jobs (user_id, job_name, status, total_items)
       VALUES (?, ?, 'processing', ?)
-    `).bind(user_id || null, job_name || '배치 작업', texts.length).run();
+    `, [user_id || null, job_name || '배치 작업', texts.length])
 
-    const jobId = jobResult.meta.last_row_id;
+    const jobId = jobResult.lastID
 
-    // Process texts (in a real implementation, this would be queued)
-    const results = [];
-    let processed = 0;
+    // Process texts
+    const results = []
+    let processed = 0
 
     for (const text of texts.slice(0, 10)) { // Limit for demo
       try {
-        let aiResponse;
-        let sentiment_score = 0;
-        let sentiment_label = 'neutral';
-        let confidence = 0;
+        const localResult = analyzeSentiment(text, 'ko')
+        let sentiment_score = 0
+        let sentiment_label = 'neutral'
+        let confidence = localResult.score
 
-        try {
-          // Try Cloudflare AI first if available
-          if (env.AI) {
-            aiResponse = await env.AI.run('@cf/huggingface/distilbert-sst-2-int8', {
-              text: text
-            });
-          }
-        } catch (error) {
-          console.log('Cloudflare AI not available for batch, using local analyzer');
-        }
-
-        if (aiResponse && Array.isArray(aiResponse) && aiResponse.length > 0) {
-          // Use Cloudflare AI result
-          const result = aiResponse[0];
-          if (result.label === 'POSITIVE') {
-            sentiment_score = result.score;
-            sentiment_label = 'positive';
-          } else if (result.label === 'NEGATIVE') {
-            sentiment_score = -result.score;
-            sentiment_label = 'negative';
-          }
-          confidence = result.score;
+        if (localResult.label === 'POSITIVE') {
+          sentiment_score = localResult.score
+          sentiment_label = 'positive'
+        } else if (localResult.label === 'NEGATIVE') {
+          sentiment_score = -localResult.score
+          sentiment_label = 'negative'
         } else {
-          // Use local sentiment analyzer as fallback
-          const localResult = analyzeSentiment(text, 'ko');
-          if (localResult.label === 'POSITIVE') {
-            sentiment_score = localResult.score;
-            sentiment_label = 'positive';
-          } else if (localResult.label === 'NEGATIVE') {
-            sentiment_score = -localResult.score;
-            sentiment_label = 'negative';
-          } else {
-            sentiment_score = 0;
-            sentiment_label = 'neutral';
-          }
-          confidence = localResult.score;
+          sentiment_score = 0
+          sentiment_label = 'neutral'
         }
 
         // Save individual result
-        await env.DB.prepare(`
+        await runInsert(`
           INSERT INTO sentiment_analyses (user_id, input_text, sentiment_score, sentiment_label, confidence, language)
           VALUES (?, ?, ?, ?, ?, 'ko')
-        `).bind(user_id || null, text, sentiment_score, sentiment_label, confidence).run();
+        `, [user_id || null, text, sentiment_score, sentiment_label, confidence])
 
         results.push({
           text,
           sentiment: { score: sentiment_score, label: sentiment_label, confidence }
-        });
+        })
 
-        processed++;
+        processed++
       } catch (error) {
-        console.error(`Error processing text: ${text}`, error);
+        console.error(`Error processing text: ${text}`, error)
       }
     }
 
@@ -232,13 +212,13 @@ app.post('/api/batch', async (c) => {
       positive: results.filter(r => r.sentiment.label === 'positive').length,
       negative: results.filter(r => r.sentiment.label === 'negative').length,
       neutral: results.filter(r => r.sentiment.label === 'neutral').length
-    };
+    }
 
-    await env.DB.prepare(`
+    await runInsert(`
       UPDATE batch_jobs 
       SET status = 'completed', processed_items = ?, results_summary = ?, completed_at = datetime('now')
       WHERE id = ?
-    `).bind(processed, JSON.stringify(summary), jobId).run();
+    `, [processed, JSON.stringify(summary), jobId])
 
     return c.json({
       job_id: jobId,
@@ -246,105 +226,100 @@ app.post('/api/batch', async (c) => {
       processed_items: processed,
       total_items: texts.length,
       summary,
-      results: results.slice(0, 5) // Return first 5 results as preview
-    });
+      results: results.slice(0, 5)
+    })
 
   } catch (error) {
-    console.error('Batch analysis error:', error);
-    return c.json({ error: '배치 분석 중 오류가 발생했습니다.' }, 500);
+    console.error('Batch analysis error:', error)
+    return c.json({ error: '배치 분석 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // Get batch job status
 app.get('/api/batch/:jobId', async (c) => {
-  const { env } = c;
-  const jobId = c.req.param('jobId');
+  const jobId = c.req.param('jobId')
 
   try {
-    const { results } = await env.DB.prepare(`
+    const results = await runQuery(`
       SELECT * FROM batch_jobs WHERE id = ?
-    `).bind(jobId).all();
+    `, [jobId])
 
     if (results.length === 0) {
-      return c.json({ error: '작업을 찾을 수 없습니다.' }, 404);
+      return c.json({ error: '작업을 찾을 수 없습니다.' }, 404)
     }
 
-    return c.json(results[0]);
+    return c.json(results[0])
 
   } catch (error) {
-    console.error('Batch job fetch error:', error);
-    return c.json({ error: '작업 상태 조회 중 오류가 발생했습니다.' }, 500);
+    console.error('Batch job fetch error:', error)
+    return c.json({ error: '작업 상태 조회 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // User management
 app.post('/api/users', async (c) => {
-  const { env } = c;
-  
   try {
-    const { email, name } = await c.req.json();
+    const { email, name } = await c.req.json()
 
     if (!email || !name) {
-      return c.json({ error: '이메일과 이름을 제공해주세요.' }, 400);
+      return c.json({ error: '이메일과 이름을 제공해주세요.' }, 400)
     }
 
-    const result = await env.DB.prepare(`
+    const result = await runInsert(`
       INSERT INTO users (email, name) VALUES (?, ?)
-    `).bind(email, name).run();
+    `, [email, name])
 
     return c.json({
-      id: result.meta.last_row_id,
+      id: result.lastID,
       email,
       name,
       created_at: new Date().toISOString()
-    });
+    })
 
-  } catch (error) {
+  } catch (error: any) {
     if (error.message && error.message.includes('UNIQUE constraint failed')) {
-      return c.json({ error: '이미 존재하는 이메일입니다.' }, 409);
+      return c.json({ error: '이미 존재하는 이메일입니다.' }, 409)
     }
-    console.error('User creation error:', error);
-    return c.json({ error: '사용자 생성 중 오류가 발생했습니다.' }, 500);
+    console.error('User creation error:', error)
+    return c.json({ error: '사용자 생성 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // Get API statistics
 app.get('/api/stats', async (c) => {
-  const { env } = c;
-
   try {
     // Total analyses
-    const totalAnalyses = await env.DB.prepare(`
+    const totalAnalyses = await runQuery(`
       SELECT COUNT(*) as count FROM sentiment_analyses
-    `).first();
+    `)
 
     // Analyses by sentiment
-    const sentimentStats = await env.DB.prepare(`
+    const sentimentStats = await runQuery(`
       SELECT sentiment_label, COUNT(*) as count 
       FROM sentiment_analyses 
       GROUP BY sentiment_label
-    `).all();
+    `)
 
     // Recent activity (last 7 days)
-    const recentActivity = await env.DB.prepare(`
+    const recentActivity = await runQuery(`
       SELECT DATE(created_at) as date, COUNT(*) as count
       FROM sentiment_analyses 
       WHERE created_at >= datetime('now', '-7 days')
       GROUP BY DATE(created_at)
       ORDER BY date DESC
-    `).all();
+    `)
 
     return c.json({
-      total_analyses: totalAnalyses.count,
-      sentiment_distribution: sentimentStats.results,
-      recent_activity: recentActivity.results
-    });
+      total_analyses: totalAnalyses[0].count,
+      sentiment_distribution: sentimentStats,
+      recent_activity: recentActivity
+    })
 
   } catch (error) {
-    console.error('Stats fetch error:', error);
-    return c.json({ error: '통계 조회 중 오류가 발생했습니다.' }, 500);
+    console.error('Stats fetch error:', error)
+    return c.json({ error: '통계 조회 중 오류가 발생했습니다.' }, 500)
   }
-});
+})
 
 // Main web interface
 app.get('/', (c) => {
@@ -367,6 +342,7 @@ app.get('/', (c) => {
                     Sentiment Analysis Platform
                 </h1>
                 <p class="text-gray-600">AI 기반 텍스트 감정 분석 플랫폼</p>
+                <p class="text-sm text-blue-600 mt-2">Railway 배포 버전</p>
             </header>
 
             <!-- Navigation -->
@@ -459,6 +435,16 @@ app.get('/', (c) => {
     </body>
     </html>
   `)
+})
+
+const port = parseInt(process.env.PORT || '3000')
+
+console.log(`🚀 Sentiment Analysis Platform starting on port ${port}`)
+console.log(`🌐 Railway deployment ready`)
+
+serve({
+  fetch: app.fetch,
+  port
 })
 
 export default app
