@@ -19,7 +19,7 @@
 - **개발 서버**: https://3000-itl33fdsa58c5si5twsag-6532622b.e2b.dev
 - **프로덕션**: (추후 Cloudflare Pages 배포 예정)
 - **API 베이스**: `/api`
-- **GitHub**: (추후 설정 예정)
+- **GitHub**: https://github.com/gregkim0704/genspark
 
 ## 데이터 아키텍처
 
